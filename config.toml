@@ -1,0 +1,13 @@
+[rabbitmq]
+host = "localhost"
+port = 5672
+username = "guest"
+password = "guest"
+vhost = "/"
+queue = "chickie_tasks"
+exchange = "chickie_exchange"
+routing_key = "task.#"
+
+[worker]
+prefetch_count = 10
+reconnect_delay_secs = 5
