@@ -1,13 +1,12 @@
 mod handlers;
 
 use anyhow::Result;
+use futures::StreamExt;
 use lapin::{
     options::*,
     types::FieldTable,
-    Connection, ConnectionProperties, Consumer,
+    Connection, ConnectionProperties, ExchangeKind,
 };
-use futures::StreamExt; // ← Necessário para o consumer stream
-use serde::Deserialize;
 use std::env;
 use std::time::Duration;
 use tracing::{info, error, warn, Level};
@@ -15,7 +14,8 @@ use tracing_subscriber::FmtSubscriber;
 
 use handlers::message_handler::handle_message;
 
-#[derive(Debug, Deserialize, Clone)]
+// ✅ Config simples - sem Deserialize, só dados
+#[derive(Debug, Clone)]
 struct RabbitMQConfig {
     host: String,
     port: u16,
@@ -27,69 +27,81 @@ struct RabbitMQConfig {
     routing_key: String,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Clone)]
 struct WorkerConfig {
     prefetch_count: u16,
     reconnect_delay_secs: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone)]
 struct Config {
     rabbitmq: RabbitMQConfig,
     worker: WorkerConfig,
 }
 
-fn get_config_path() -> String {
-    if let Ok(path) = env::var("CONFIG_PATH") {
-        return path;
+// ✅ Carrega config direto das env vars com defaults
+fn load_config() -> Config {
+    Config {
+        rabbitmq: RabbitMQConfig {
+            host: env::var("RABBITMQ_HOST").unwrap_or_else(|_| "localhost".to_string()),
+            port: env::var("RABBITMQ_PORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(5672),
+            username: env::var("RABBITMQ_USER").unwrap_or_else(|_| "guest".to_string()),
+            password: env::var("RABBITMQ_PASS").unwrap_or_else(|_| "guest".to_string()),
+            vhost: env::var("RABBITMQ_VHOST").unwrap_or_else(|_| "/".to_string()),
+            queue: env::var("RABBITMQ_QUEUE").unwrap_or_else(|_| "chickie_tasks".to_string()),
+            exchange: env::var("RABBITMQ_EXCHANGE").unwrap_or_else(|_| "chickie_exchange".to_string()),
+            routing_key: env::var("RABBITMQ_ROUTING_KEY").unwrap_or_else(|_| "task.#".to_string()),
+        },
+        worker: WorkerConfig {
+            prefetch_count: env::var("WORKER_PREFETCH")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(10),
+            reconnect_delay_secs: env::var("WORKER_RECONNECT_DELAY")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(5),
+        },
     }
-    "config.toml".to_string()
 }
 
-fn load_config(path: &str) -> Result<Config> {
-    let content = std::fs::read_to_string(path)?;
-    let config: Config = toml::from_str(&content)?;
-    Ok(config)
-}
-
-fn build_amqp_url(config: &RabbitMQConfig) -> String {
+fn build_amqp_url(cfg: &RabbitMQConfig) -> String {
     format!(
         "amqp://{}:{}@{}:{}/{}",
-        config.username,
-        config.password,
-        config.host,
-        config.port,
-        config.vhost
+        cfg.username, cfg.password, cfg.host, cfg.port, cfg.vhost
     )
 }
 
-async fn setup_queue(conn: &Connection, config: &RabbitMQConfig) -> Result<()> {
+async fn setup_queue(conn: &Connection, cfg: &RabbitMQConfig) -> Result<()> {
     let channel = conn.create_channel().await?;
 
     channel
         .exchange_declare(
-            &config.exchange,
-            lapin::ExchangeKind::Topic,
+            &cfg.exchange,
+            ExchangeKind::Topic,
             ExchangeDeclareOptions::default(),
             FieldTable::default(),
         )
         .await?;
-    info!("✅ Exchange '{}' declarada", config.exchange);
+    info!("✅ Exchange '{}' declarada", cfg.exchange);
 
     channel
         .queue_declare(
-            &config.queue,
+            &cfg.queue,
             QueueDeclareOptions::default(),
             FieldTable::default(),
         )
         .await?;
-    info!("✅ Queue '{}' declarada", config.queue);
+    info!("✅ Queue '{}' declarada", cfg.queue);
 
     channel
         .queue_bind(
-            &config.queue,
-            &config.exchange,
-            &config.routing_key,
+            &cfg.queue,
+            &cfg.exchange,
+            &cfg.routing_key,
             QueueBindOptions::default(),
             FieldTable::default(),
         )
@@ -101,80 +113,68 @@ async fn setup_queue(conn: &Connection, config: &RabbitMQConfig) -> Result<()> {
 
 async fn consume_messages(
     conn: &Connection,
-    config: &RabbitMQConfig,
-    worker_config: &WorkerConfig,
+    rmq_cfg: &RabbitMQConfig,
+    worker_cfg: &WorkerConfig,
 ) -> Result<()> {
     let channel = conn.create_channel().await?;
 
     channel
-        .basic_qos(
-            worker_config.prefetch_count,
-            BasicQosOptions::default(),
-        )
+        .basic_qos(worker_cfg.prefetch_count, BasicQosOptions::default())
         .await?;
-    info!("✅ Prefetch count: {}", worker_config.prefetch_count);
 
-    // ✅ CORREÇÃO: Consumer agora é um Stream
     let mut consumer = channel
         .basic_consume(
-            &config.queue,
+            &rmq_cfg.queue,
             "chickie_worker",
             BasicConsumeOptions::default(),
             FieldTable::default(),
         )
         .await?;
-    info!("✅ Consumer iniciado na queue '{}'", config.queue);
+    info!("✅ Consumer iniciado na queue '{}'", rmq_cfg.queue);
 
-    // ✅ CORREÇÃO: Usar StreamExt::next() ao invés de recv()
     while let Some(Ok(delivery)) = consumer.next().await {
         let delivery_tag = delivery.delivery_tag;
         let body = String::from_utf8_lossy(&delivery.data);
-        
-        info!("📩 Mensagem recebida (tag {}): {}", delivery_tag, body);
+        info!("📩 Mensagem (tag {}): {}", delivery_tag, body);
 
         match handle_message(&body).await {
             Ok(_) => {
                 channel
                     .basic_ack(delivery_tag, BasicAckOptions { multiple: false })
                     .await?;
-                info!("✅ Mensagem acked");
             }
             Err(e) => {
-                error!("❌ Erro ao processar mensagem: {}", e);
+                error!("❌ Erro ao processar: {}", e);
                 channel
                     .basic_nack(
                         delivery_tag,
-                        BasicNackOptions { multiple: false, requeue: true }
+                        BasicNackOptions { multiple: false, requeue: true },
                     )
                     .await?;
-                warn!("⚠️  Mensagem nack'd e requeuada");
             }
         }
     }
-
     Ok(())
 }
 
-async fn run_worker(config: Config) -> Result<()> {
-    let amqp_url = build_amqp_url(&config.rabbitmq);
-    info!("🔗 Conectando ao RabbitMQ: {}", amqp_url.replace(&config.rabbitmq.password, "***"));
+async fn run_worker(cfg: Config) -> Result<()> {
+    let amqp_url = build_amqp_url(&cfg.rabbitmq);
+    let safe_url = amqp_url.replace(&cfg.rabbitmq.password, "***");
+    info!("🔗 Conectando ao RabbitMQ: {}", safe_url);
 
     loop {
         match Connection::connect(&amqp_url, ConnectionProperties::default()).await {
             Ok(conn) => {
-                info!("✅ Conectado ao RabbitMQ");
+                info!("✅ Conectado");
 
-                if let Err(e) = setup_queue(&conn, &config.rabbitmq).await {
-                    error!("❌ Erro ao setup queue: {}", e);
-                    tokio::time::sleep(Duration::from_secs(config.worker.reconnect_delay_secs)).await;
+                if let Err(e) = setup_queue(&conn, &cfg.rabbitmq).await {
+                    error!("❌ Erro no setup: {}", e);
+                    tokio::time::sleep(Duration::from_secs(cfg.worker.reconnect_delay_secs)).await;
                     continue;
                 }
 
-                match consume_messages(&conn, &config.rabbitmq, &config.worker).await {
-                    Ok(_) => break,
-                    Err(e) => {
-                        error!("❌ Erro no consumer: {}", e);
-                    }
+                if let Err(e) = consume_messages(&conn, &cfg.rabbitmq, &cfg.worker).await {
+                    error!("❌ Erro no consumer: {}", e);
                 }
             }
             Err(e) => {
@@ -182,11 +182,8 @@ async fn run_worker(config: Config) -> Result<()> {
             }
         }
 
-        info!("🔄 Reconectando em {}s...", config.worker.reconnect_delay_secs);
-        tokio::time::sleep(Duration::from_secs(config.worker.reconnect_delay_secs)).await;
+        tokio::time::sleep(Duration::from_secs(cfg.worker.reconnect_delay_secs)).await;
     }
-
-    Ok(())
 }
 
 #[tokio::main]
@@ -196,22 +193,14 @@ async fn main() -> Result<()> {
         .with_env_filter("chickie_worker=info")
         .init();
 
-    let config_path = get_config_path();
     info!("🔧 Chickie Worker iniciando...");
-    info!("📄 Config: {}", config_path);
 
-    let config = match load_config(&config_path) {
-        Ok(c) => c,
-        Err(e) => {
-            error!("❌ Falha ao carregar config: {}", e);
-            return Ok(());
-        }
-    };
+    let cfg = load_config();
+    
+    info!("📡 Queue: {}", cfg.rabbitmq.queue);
+    info!("📡 Exchange: {}", cfg.rabbitmq.exchange);
 
-    info!("📡 Queue: {}", config.rabbitmq.queue);
-    info!("📡 Exchange: {}", config.rabbitmq.exchange);
-
-    if let Err(e) = run_worker(config).await {
+    if let Err(e) = run_worker(cfg).await {
         error!("❌ Worker falhou: {}", e);
     }
 
