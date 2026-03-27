@@ -65,13 +65,20 @@ impl WorkerConfig {
     pub fn from_env() -> Self {
         let def = Self::default();
         Self {
-            host: env::var("RABBITMQ_HOST").unwrap_or(def.host),
-            port: env::var("RABBITMQ_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(def.port),
-            username: env::var("RABBITMQ_USER").unwrap_or(def.username),
-            password: env::var("RABBITMQ_PASS").unwrap_or(def.password),
-            vhost: env::var("RABBITMQ_VHOST").unwrap_or(def.vhost),
-            exchange: env::var("RABBITMQ_EXCHANGE").unwrap_or(def.exchange),
-            prefetch_count: env::var("WORKER_PREFETCH").ok().and_then(|p| p.parse().ok()).unwrap_or(def.prefetch_count),
+            host: env::var("RABBITMQ_HOST")
+                .expect("RABBITMQ_HOST não encontrado!"),
+            port: env::var("RABBITMQ_PORT").ok().and_then(|p| p.parse().ok())
+                .expect("RABBITMQ_PORT não encontrado!"),
+            username: env::var("RABBITMQ_USER")
+                .expect("RABBITMQ_USER não encontrado!"),
+            password: env::var("RABBITMQ_PASS")
+                .expect("RABBITMQ_PASS não encontrado!"),
+            vhost: env::var("RABBITMQ_VHOST")
+                .expect("RABBITMQ_VHOST não encontrado!"),
+            exchange: env::var("RABBITMQ_EXCHANGE")
+                .expect("RABBITMQ_EXCHANGE não encontrado!"),
+            prefetch_count: env::var("WORKER_PREFETCH").ok().and_then(|p| p.parse().ok())
+                .unwrap_or(def.prefetch_count),
             reconnect_delay: env::var("WORKER_RECONNECT_DELAY")
                 .ok()
                 .and_then(|p| p.parse::<u64>().ok())
@@ -82,8 +89,8 @@ impl WorkerConfig {
 
     fn amqp_url(&self) -> String {
         format!(
-            "amqp://{}:{}@{}/{}",  // porta omitida por conta de dns configurado no traefik
-            self.username, self.password, self.host, self.vhost
+            "amqp://{}:{}@{}:{}/{}",  // porta omitida por conta de dns configurado no traefik
+            self.username, self.password, self.host, self.port, self.vhost
         )
     }
 
