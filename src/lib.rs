@@ -82,8 +82,8 @@ impl WorkerConfig {
 
     fn amqp_url(&self) -> String {
         format!(
-            "amqp://{}:{}@{}:{}/{}",
-            self.username, self.password, self.host, self.port, self.vhost
+            "amqp://{}:{}@{}/{}",  // porta omitida por conta de dns configurado no traefik
+            self.username, self.password, self.host, self.vhost
         )
     }
 
@@ -115,7 +115,7 @@ impl Worker {
     /// worker.queue("emails", "task.email.#", |body| async move {
     ///     println!("processando email: {body}");
     ///     Ok(())
-    /// });
+    /// }); 
     /// ```
     pub fn queue<F, Fut>(&mut self, queue: &str, routing_key: &str, handler: F) -> &mut Self
     where
